@@ -17,6 +17,7 @@ short_level_3_pct = input.float(8.0, title="Уровень 3 Short (%)", step=0.
 short_level_4_pct = input.float(8.0, title="Уровень 4 Short (%)", step=0.1)
 long_stop_loss_pct = input.float(12.0, title="Стоп-лосс Long (%)", step=0.1)
 short_stop_loss_pct = input.float(12.0, title="Стоп-лосс Short (%)", step=0.1)
+band_calc_method = input.string("Standard Deviation", title="Band Calculation Method", options=["Standard Deviation", "Percentage"], group="VWAP Settings")
 trade_direction = input.string("Long", title="Направление сделки", options=["Long", "Short", "Both"])
 start_year = input.int(2025, title="Год начала")
 start_month = input.int(1, title="Месяц начала", minval=1, maxval=12)
@@ -25,8 +26,11 @@ end_month = input.int(12, title="Месяц окончания", minval=1, maxva
 
 // Даты
 start_date = timestamp(start_year, start_month, 1, 0, 0)
-end_date = timestamp(end_year, end_month, 31, 23, 59)
-in_date_range = (time >= start_date) and (time <= end_date)
+// Use first day of next month to properly handle months with different day counts
+end_month_next = end_month == 12 ? 1 : end_month + 1
+end_year_adjusted = end_month == 12 ? end_year + 1 : end_year
+end_date = timestamp(end_year_adjusted, end_month_next, 1, 0, 0)
+in_date_range = (time >= start_date) and (time < end_date)
 
 // VWAP из оригинального индикатора
 cumVolume = ta.cum(volume)
@@ -66,7 +70,7 @@ if not (hideonDWM and timeframe.isdwm)
     [_vwap, _stdevUpper, _] = ta.vwap(src, isNewPeriod, 1)
     vwap_value := _vwap
     stdevAbs = _stdevUpper - _vwap
-    bandBasis = "Standard Deviation" == "Standard Deviation" ? stdevAbs : _vwap * 0.01
+    bandBasis = band_calc_method == "Standard Deviation" ? stdevAbs : _vwap * 0.01
     upperBandValue1 := _vwap + bandBasis * 1.0
     lowerBandValue1 := _vwap - bandBasis * 1.0
     upperBandValue2 := _vwap + bandBasis * 2.0
@@ -74,15 +78,15 @@ if not (hideonDWM and timeframe.isdwm)
     upperBandValue3 := _vwap + bandBasis * 3.0
     lowerBandValue3 := _vwap - bandBasis * 3.0
 
-// Уровни на основе VWAP
+// Уровни на основе VWAP (cumulative percentages)
 long_level_1 = vwap_value * (1 - long_level_1_pct / 100)
-long_level_2 = vwap_value * (1 - long_level_2_pct / 100)
-long_level_3 = vwap_value * (1 - long_level_3_pct / 100)
-long_level_4 = vwap_value * (1 - long_level_4_pct / 100)
+long_level_2 = vwap_value * (1 - (long_level_1_pct + long_level_2_pct) / 100)
+long_level_3 = vwap_value * (1 - (long_level_1_pct + long_level_2_pct + long_level_3_pct) / 100)
+long_level_4 = vwap_value * (1 - (long_level_1_pct + long_level_2_pct + long_level_3_pct + long_level_4_pct) / 100)
 short_level_1 = vwap_value * (1 + short_level_1_pct / 100)
-short_level_2 = vwap_value * (1 + short_level_2_pct / 100)
-short_level_3 = vwap_value * (1 + short_level_3_pct / 100)
-short_level_4 = vwap_value * (1 + short_level_4_pct / 100)
+short_level_2 = vwap_value * (1 + (short_level_1_pct + short_level_2_pct) / 100)
+short_level_3 = vwap_value * (1 + (short_level_1_pct + short_level_2_pct + short_level_3_pct) / 100)
+short_level_4 = vwap_value * (1 + (short_level_1_pct + short_level_2_pct + short_level_3_pct + short_level_4_pct) / 100)
 
 // Уровни стоп-лосса
 long_stop_loss = vwap_value * (1 - long_stop_loss_pct / 100)
