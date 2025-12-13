@@ -33,7 +33,9 @@ class BybitVWAPStrategy:
                 "apiKey": api_key,
                 "secret": api_secret,
                 "enableRateLimit": True,
-                "options": {"defaultType": "swap"},
+                # ВАЖНО: это фьючерсы (perpetual swaps), не spot
+                # defaultSubType/settle закрепляет именно USDT linear swap, если у Bybit есть совпадающие id на spot.
+                "options": {"defaultType": "swap", "defaultSubType": "linear", "defaultSettle": "USDT"},
                 "timeout": 30000,
             }
         )
@@ -87,6 +89,24 @@ class BybitVWAPStrategy:
             m = markets_by_id[symbol]
             # ccxt may store list under markets_by_id
             if isinstance(m, list):
+                # Bybit часто имеет одинаковый id для spot и swap (например BTCUSDT).
+                # Нам нужен именно USDT linear swap (contract).
+                preferred = []
+                for mm in m:
+                    if not isinstance(mm, dict):
+                        continue
+                    if mm.get("swap") or mm.get("type") == "swap" or mm.get("contract") is True:
+                        # prefer linear USDT-settled swaps
+                        if (mm.get("linear") is True) or (str(mm.get("settle", "")).upper() == "USDT"):
+                            preferred.append(mm)
+                if preferred:
+                    # если несколько, берём самый первый подходящий
+                    return preferred[0]
+                # fallback: любой swap/contract
+                for mm in m:
+                    if isinstance(mm, dict) and (mm.get("swap") or mm.get("type") == "swap" or mm.get("contract") is True):
+                        return mm
+                # last resort
                 return m[0]
             return m
 
