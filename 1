@@ -1,0 +1,233 @@
+//@version=6
+strategy("VCS 2 with VWAP Levels (Single Entry/Exit)", overlay=true)
+
+// Настройки
+hideonDWM = input(false, title="Hide VWAP on 1D or Above", group="VWAP Settings")
+anchor = input.string(defval="Week", title="Anchor Period", options=["Session", "Week", "Month", "Quarter", "Year", "Decade", "Century", "Earnings", "Dividends", "Splits"], group="VWAP Settings")
+src = input(hlc3, title="Source", group="VWAP Settings")
+offset = input.int(0, title="Offset", group="VWAP Settings", minval=0)
+
+long_level_1_pct = input.float(4.0, title="Уровень 1 Long (%)", step=0.1)
+long_level_2_pct = input.float(8.0, title="Уровень 2 Long (%)", step=0.1)
+long_level_3_pct = input.float(8.0, title="Уровень 3 Long (%)", step=0.1)
+long_level_4_pct = input.float(8.0, title="Уровень 4 Long (%)", step=0.1)
+short_level_1_pct = input.float(4.0, title="Уровень 1 Short (%)", step=0.1)
+short_level_2_pct = input.float(8.0, title="Уровень 2 Short (%)", step=0.1)
+short_level_3_pct = input.float(8.0, title="Уровень 3 Short (%)", step=0.1)
+short_level_4_pct = input.float(8.0, title="Уровень 4 Short (%)", step=0.1)
+long_stop_loss_pct = input.float(12.0, title="Стоп-лосс Long (%)", step=0.1)
+short_stop_loss_pct = input.float(12.0, title="Стоп-лосс Short (%)", step=0.1)
+trade_direction = input.string("Long", title="Направление сделки", options=["Long", "Short", "Both"])
+start_year = input.int(2025, title="Год начала")
+start_month = input.int(1, title="Месяц начала", minval=1, maxval=12)
+end_year = input.int(2025, title="Год окончания")
+end_month = input.int(12, title="Месяц окончания", minval=1, maxval=12)
+
+// Даты
+start_date = timestamp(start_year, start_month, 1, 0, 0)
+end_date = timestamp(end_year, end_month, 31, 23, 59)
+in_date_range = (time >= start_date) and (time <= end_date)
+
+// VWAP из оригинального индикатора
+cumVolume = ta.cum(volume)
+if barstate.islast and cumVolume == 0
+    runtime.error("No volume is provided by the data vendor.")
+
+new_earnings = request.earnings(syminfo.tickerid, earnings.actual, barmerge.gaps_on, barmerge.lookahead_on, ignore_invalid_symbol=true)
+new_dividends = request.dividends(syminfo.tickerid, dividends.gross, barmerge.gaps_on, barmerge.lookahead_on, ignore_invalid_symbol=true)
+new_split = request.splits(syminfo.tickerid, splits.denominator, barmerge.gaps_on, barmerge.lookahead_on, ignore_invalid_symbol=true)
+
+isNewPeriod = switch anchor
+    "Earnings"  => not na(new_earnings)
+    "Dividends" => not na(new_dividends)
+    "Splits"    => not na(new_split)
+    "Session"   => timeframe.change("D")
+    "Week"      => timeframe.change("W")
+    "Month"     => timeframe.change("M")
+    "Quarter"   => timeframe.change("3M")
+    "Year"      => timeframe.change("12M")
+    "Decade"    => timeframe.change("12M") and year % 10 == 0
+    "Century"   => timeframe.change("12M") and year % 100 == 0
+    => false
+
+isEsdAnchor = anchor == "Earnings" or anchor == "Dividends" or anchor == "Splits"
+if na(src[1]) and not isEsdAnchor
+    isNewPeriod := true
+
+float vwap_value = na
+float upperBandValue1 = na
+float lowerBandValue1 = na
+float upperBandValue2 = na
+float lowerBandValue2 = na
+float upperBandValue3 = na
+float lowerBandValue3 = na
+
+if not (hideonDWM and timeframe.isdwm)
+    [_vwap, _stdevUpper, _] = ta.vwap(src, isNewPeriod, 1)
+    vwap_value := _vwap
+    stdevAbs = _stdevUpper - _vwap
+    bandBasis = "Standard Deviation" == "Standard Deviation" ? stdevAbs : _vwap * 0.01
+    upperBandValue1 := _vwap + bandBasis * 1.0
+    lowerBandValue1 := _vwap - bandBasis * 1.0
+    upperBandValue2 := _vwap + bandBasis * 2.0
+    lowerBandValue2 := _vwap - bandBasis * 2.0
+    upperBandValue3 := _vwap + bandBasis * 3.0
+    lowerBandValue3 := _vwap - bandBasis * 3.0
+
+// Уровни на основе VWAP
+long_level_1 = vwap_value * (1 - long_level_1_pct / 100)
+long_level_2 = vwap_value * (1 - long_level_2_pct / 100)
+long_level_3 = vwap_value * (1 - long_level_3_pct / 100)
+long_level_4 = vwap_value * (1 - long_level_4_pct / 100)
+short_level_1 = vwap_value * (1 + short_level_1_pct / 100)
+short_level_2 = vwap_value * (1 + short_level_2_pct / 100)
+short_level_3 = vwap_value * (1 + short_level_3_pct / 100)
+short_level_4 = vwap_value * (1 + short_level_4_pct / 100)
+
+// Уровни стоп-лосса
+long_stop_loss = vwap_value * (1 - long_stop_loss_pct / 100)
+short_stop_loss = vwap_value * (1 + short_stop_loss_pct / 100)
+
+// Переменные состояния
+var bool long_level_1_entered = false
+var bool long_level_2_entered = false
+var bool long_level_3_entered = false
+var bool long_level_4_entered = false
+var bool short_level_1_entered = false
+var bool short_level_2_entered = false
+var bool short_level_3_entered = false
+var bool short_level_4_entered = false
+var bool long_trading_paused = false
+var bool short_trading_paused = false
+
+// Логика Long
+if (in_date_range and trade_direction != "Short")
+    if (not long_trading_paused)
+        if (low <= long_level_1 and not long_level_1_entered)
+            qty = math.max(1, math.min(1000000, math.floor(strategy.equity * 0.25 / close)))
+            strategy.entry("Buy Level 1", strategy.long, qty=qty)
+            long_level_1_entered := true
+        if (low <= long_level_2 and not long_level_2_entered)
+            qty = math.max(1, math.min(1000000, math.floor(strategy.equity * 0.25 / close)))
+            strategy.entry("Buy Level 2", strategy.long, qty=qty)
+            long_level_2_entered := true
+        if (low <= long_level_3 and not long_level_3_entered)
+            qty = math.max(1, math.min(1000000, math.floor(strategy.equity * 0.25 / close)))
+            strategy.entry("Buy Level 3", strategy.long, qty=qty)
+            long_level_3_entered := true
+        if (low <= long_level_4 and not long_level_4_entered)
+            qty = math.max(1, math.min(1000000, math.floor(strategy.equity * 0.25 / close)))
+            strategy.entry("Buy Level 4", strategy.long, qty=qty)
+            long_level_4_entered := true
+
+    // Закрытие позиций по новым уровням
+    if (long_level_1_entered and high >= short_level_4)
+        strategy.close("Buy Level 1")
+        long_level_1_entered := false
+    if (long_level_2_entered and high >= short_level_3)
+        strategy.close("Buy Level 2")
+        long_level_2_entered := false
+    if (long_level_3_entered and high >= short_level_2)
+        strategy.close("Buy Level 3")
+        long_level_3_entered := false
+    if (long_level_4_entered and high >= short_level_1)
+        strategy.close("Buy Level 4")
+        long_level_4_entered := false
+
+    if (low <= long_stop_loss and (long_level_1_entered or long_level_2_entered or long_level_3_entered or long_level_4_entered))
+        if (long_level_1_entered)
+            strategy.close("Buy Level 1")
+            long_level_1_entered := false
+        if (long_level_2_entered)
+            strategy.close("Buy Level 2")
+            long_level_2_entered := false
+        if (long_level_3_entered)
+            strategy.close("Buy Level 3")
+            long_level_3_entered := false
+        if (long_level_4_entered)
+            strategy.close("Buy Level 4")
+            long_level_4_entered := false
+        long_trading_paused := true
+
+    if (high >= short_level_1 and long_trading_paused)
+        long_trading_paused := false
+
+// Логика Short
+if (in_date_range and trade_direction != "Long")
+    if (not short_trading_paused)
+        if (high >= short_level_1 and not short_level_1_entered)
+            qty = math.max(1, math.min(1000000, math.floor(strategy.equity * 0.25 / close)))
+            strategy.entry("Sell Level 1", strategy.short, qty=qty)
+            short_level_1_entered := true
+        if (high >= short_level_2 and not short_level_2_entered)
+            qty = math.max(1, math.min(1000000, math.floor(strategy.equity * 0.25 / close)))
+            strategy.entry("Sell Level 2", strategy.short, qty=qty)
+            short_level_2_entered := true
+        if (high >= short_level_3 and not short_level_3_entered)
+            qty = math.max(1, math.min(1000000, math.floor(strategy.equity * 0.25 / close)))
+            strategy.entry("Sell Level 3", strategy.short, qty=qty)
+            short_level_3_entered := true
+        if (high >= short_level_4 and not short_level_4_entered)
+            qty = math.max(1, math.min(1000000, math.floor(strategy.equity * 0.25 / close)))
+            strategy.entry("Sell Level 4", strategy.short, qty=qty)
+            short_level_4_entered := true
+
+    // Закрытие позиций по новым уровням
+    if (short_level_1_entered and low <= long_level_4)
+        strategy.close("Sell Level 1")
+        short_level_1_entered := false
+    if (short_level_2_entered and low <= long_level_3)
+        strategy.close("Sell Level 2")
+        short_level_2_entered := false
+    if (short_level_3_entered and low <= long_level_2)
+        strategy.close("Sell Level 3")
+        short_level_3_entered := false
+    if (short_level_4_entered and low <= long_level_1)
+        strategy.close("Sell Level 4")
+        short_level_4_entered := false
+
+    if (high >= short_stop_loss and (short_level_1_entered or short_level_2_entered or short_level_3_entered or short_level_4_entered))
+        if (short_level_1_entered)
+            strategy.close("Sell Level 1")
+            short_level_1_entered := false
+        if (short_level_2_entered)
+            strategy.close("Sell Level 2")
+            short_level_2_entered := false
+        if (short_level_3_entered)
+            strategy.close("Sell Level 3")
+            short_level_3_entered := false
+        if (short_level_4_entered)
+            strategy.close("Sell Level 4")
+            short_level_4_entered := false
+        short_trading_paused := true
+
+    if (low <= long_level_1 and short_trading_paused)
+        short_trading_paused := false
+
+// Визуализация
+plot(vwap_value, title="VWAP", color=color.blue, linewidth=2)
+plot(long_level_1, title="Уровень 1 Long", color=color.green, linewidth=1, style=plot.style_circles)
+plot(long_level_2, title="Уровень 2 Long", color=color.green, linewidth=1, style=plot.style_circles)
+plot(long_level_3, title="Уровень 3 Long", color=color.green, linewidth=1, style=plot.style_circles)
+plot(long_level_4, title="Уровень 4 Long", color=color.green, linewidth=1, style=plot.style_circles)
+plot(short_level_1, title="Уровень 1 Short", color=color.red, linewidth=1, style=plot.style_circles)
+plot(short_level_2, title="Уровень 2 Short", color=color.red, linewidth=1, style=plot.style_circles)
+plot(short_level_3, title="Уровень 3 Short", color=color.red, linewidth=1, style=plot.style_circles)
+plot(short_level_4, title="Уровень 4 Short", color=color.red, linewidth=1, style=plot.style_circles)
+plot(long_stop_loss, title="Стоп-лосс Long", color=color.orange, linewidth=1, style=plot.style_circles)
+plot(short_stop_loss, title="Стоп-лосс Short", color=color.orange, linewidth=1, style=plot.style_circles)
+
+// Отладка: выводим значения только для последнего бара
+var float debug_vwap = na
+var float debug_long_level_1 = na
+var float debug_long_level_2 = na
+var float debug_long_stop_loss = na
+if barstate.islast
+    debug_vwap := vwap_value
+    debug_long_level_1 := long_level_1
+    debug_long_level_2 := long_level_2
+    debug_long_stop_loss := long_stop_loss
+plot(not na(debug_vwap) ? debug_vwap : na, title="VWAP (Last)", color=color.blue, style=plot.style_cross, linewidth=2)
+plot(not na(debug_long_level_1) ? debug_long_level_1 : na, title="L1 (Last)", color=color.green, style=plot.style_cross, linewidth=2)
+plot(not na(debug_long_level_2) ? debug_long_level_2 : na, title="L2 (Last)", color=color.green, style=plot.style_cross, linewidth=2)
+plot(not na(debug_long_stop_loss) ? debug_long_stop_loss : na, title="SL Long (Last)", color=color.orange, style=plot.style_cross, linewidth=2)
