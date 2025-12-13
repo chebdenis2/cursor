@@ -368,14 +368,17 @@ class BybitVWAPStrategy:
                     logger.info("ОБНАРУЖЕНА ОТКРЫТАЯ ПОЗИЦИЯ — ВОССТАНАВЛИВАЕМ ФЛАГ")
                     if "level_1" in self.state["positions"]:
                         self.state["positions"]["level_1"]["active"] = True
+                        self.state["positions"]["level_1"]["filled"] = True
                         logger.info("Восстановлен флаг level_1")
                         self.save_state()
 
             elif total_qty < 1e-6:
                 closed_keys = []
+                # Позиции на бирже нет: считаем цикл завершённым, сбрасываем уровни,
+                # чтобы входы могли ставиться заново ТОЛЬКО после закрытия (TP/SL).
                 for key, pos in self.state["positions"].items():
-                    if pos.get("active", False):
-                        logger.info(f"НА БИРЖЕ НЕТ ПОЗИЦИИ — СБРАСЫВАЕМ ФЛАГ {key}")
+                    if pos.get("active", False) or pos.get("filled", False):
+                        logger.info(f"НА БИРЖЕ НЕТ ПОЗИЦИИ — СБРАСЫВАЕМ ЦИКЛ {key}")
                         for oid_key in ["tp_order_id", "sl_order_id"]:
                             order_id = pos.get(oid_key)
                             if order_id:
@@ -385,17 +388,14 @@ class BybitVWAPStrategy:
                                 except Exception:
                                     pass
                                 pos[oid_key] = None
+                        pos["active"] = False
+                        pos["filled"] = False
+                        pos.pop("entry_order_id", None)
                         closed_keys.append(key)
-
-                for key in closed_keys:
-                    self.state["positions"][key]["active"] = False
-                    # Если позиции нет, а entry_order_id уже не в стакане — очищаем,
-                    # иначе check_and_handle_executions может зациклиться на «исполнено».
-                    self.state["positions"][key].pop("entry_order_id", None)
 
                 if closed_keys:
                     self.save_state()
-                    logger.info(f"Сброшено {len(closed_keys)} устаревших флагов")
+                    logger.info(f"Сброшено {len(closed_keys)} флагов/уровней (позиция закрыта)")
 
         except Exception as e:
             logger.error(f"Ошибка синхронизации: {e}")
@@ -487,6 +487,9 @@ class BybitVWAPStrategy:
         for key, pos in self.state["positions"].items():
             if pos.get("active", False):
                 continue
+            # Если уровень уже был исполнен в текущем цикле — не трогаем и не перевыставляем
+            if pos.get("filled", False):
+                continue
             order_id = pos.get("entry_order_id")
             if order_id:
                 try:
@@ -500,7 +503,8 @@ class BybitVWAPStrategy:
         placed = 0
         for i, price in enumerate(entry_levels):
             key = f"level_{i + 1}"
-            if self.state["positions"].get(key, {}).get("active", False):
+            existing = self.state["positions"].get(key, {})
+            if existing.get("active", False) or existing.get("filled", False):
                 continue
 
             # entry_size_usdt is intended as margin; margin requirement is ~entry_size_usdt (notional/leverage)
@@ -531,6 +535,7 @@ class BybitVWAPStrategy:
                     "tp_order_id": None,
                     "sl_order_id": None,
                     "active": False,
+                    "filled": False,
                 }
                 logger.info(f"НОВАЯ ЛИМИТКА {side} {qty:.6f} @ {price:.1f} | {key}")
                 placed += 1
@@ -565,6 +570,10 @@ class BybitVWAPStrategy:
                             # Доп. защита: подтверждаем наличие позиции на бирже
                             if self._has_exchange_position():
                                 pos["active"] = True
+                                pos["filled"] = True
+                                # чтобы не зацикливаться и не пытаться отменять "закрытый" ордер как входной
+                                pos["filled_entry_order_id"] = oid
+                                pos.pop("entry_order_id", None)
                                 executed = True
                                 logger.info(f"ВХОД {key} ИСПОЛНЕН")
                             else:
