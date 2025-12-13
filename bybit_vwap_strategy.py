@@ -210,6 +210,40 @@ class BybitVWAPStrategy:
         except Exception as e:
             logger.error(f"Ошибка при отмене лимиток: {e}")
 
+    def cancel_all_pending_exits(self):
+        """Отменяет TP/SL ордера, созданные этим запуском бота (по client_prefix)."""
+        cancelled = 0
+        try:
+            open_orders = self.exchange.fetch_open_orders(self.symbol)
+            for order in open_orders:
+                cid = order.get("clientOrderId", "") or ""
+                if not cid or self.client_prefix not in cid:
+                    continue
+                if "_TP" not in cid and "_SL" not in cid:
+                    continue
+
+                oid = order.get("id")
+                if not oid:
+                    continue
+
+                try:
+                    self.exchange.cancel_order(oid, self.symbol)
+                    cancelled += 1
+                except Exception:
+                    pass
+
+                # Почистим state, если там были эти id
+                for pos in self.state.get("positions", {}).values():
+                    if pos.get("tp_order_id") == oid:
+                        pos["tp_order_id"] = None
+                    if pos.get("sl_order_id") == oid:
+                        pos["sl_order_id"] = None
+
+            if cancelled:
+                logger.info(f"Отменено {cancelled} TP/SL ордеров бота")
+        except Exception as e:
+            logger.error(f"Ошибка при отмене TP/SL: {e}")
+
     def fetch_klines(self, limit: int = 500):
         try:
             ohlcv = self.exchange.fetch_ohlcv(self.symbol, self.timeframe, limit=limit)
@@ -335,6 +369,10 @@ class BybitVWAPStrategy:
         side = "Sell" if self.direction == "LONG" else "Buy"
 
         logger.info(f"ПЕРЕУСТАНОВКА TP/SL → TP={tp_price} | SL={sl_price}")
+
+        # На всякий случай: убираем выходные ордера, созданные этим запуском,
+        # даже если state не полностью их отслеживает.
+        self.cancel_all_pending_exits()
 
         # Cancel previous TP/SL
         for key, pos in self.state["positions"].items():
@@ -526,20 +564,13 @@ class BybitVWAPStrategy:
 
                     self.sync_state_with_exchange()
 
+                    # На каждой новой свече принудительно перевыставляем TP/SL (если есть позиция)
                     if any(p.get("active", False) for p in self.state["positions"].values()):
                         self.update_tp_sl_for_all(vwap)
 
-                    # Optional gating: only place entries if we're near at least one level
-                    if price == price and hasattr(self, "approach_distance_pct"):
-                        nearest = min(abs(price - lvl) / price * 100 for lvl in levels["entry_levels"])
-                        if nearest <= float(self.approach_distance_pct):
-                            self.place_all_entry_orders(levels["entry_levels"])
-                        else:
-                            logger.info(
-                                f"Цена далеко от уровней (min {nearest:.3f}% > {self.approach_distance_pct}%) — лимитки не обновляем"
-                            )
-                    else:
-                        self.place_all_entry_orders(levels["entry_levels"])
+                    # На каждой новой свече принудительно перевыставляем входные лимитки
+                    self.cancel_all_pending_entries()
+                    self.place_all_entry_orders(levels["entry_levels"])
 
                 if last_vwap and abs(vwap - last_vwap) / vwap > 0.0005:
                     if any(p.get("active", False) for p in self.state["positions"].values()):
