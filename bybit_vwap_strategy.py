@@ -76,6 +76,23 @@ class BybitVWAPStrategy:
         logger.info("Запуск бота — синхронизация состояния с биржей...")
         self.sync_state_with_exchange()
 
+    def _has_exchange_position(self) -> bool:
+        """Проверка фактической позиции на бирже по направлению (LONG/SHORT)."""
+        try:
+            positions = self.exchange.fetch_positions([self.symbol])
+            for p in positions:
+                side_raw = (p.get("side") or "").lower()
+                side = "buy" if side_raw in {"buy", "long"} else "sell" if side_raw in {"sell", "short"} else ""
+                qty = float(p.get("contracts", 0) or 0)
+                if qty <= 1e-6:
+                    continue
+                if (side == "buy" and self.direction == "LONG") or (side == "sell" and self.direction == "SHORT"):
+                    return True
+            return False
+        except Exception:
+            # В случае ошибки не делаем ложных выводов
+            return False
+
     def _resolve_market(self, symbol: str) -> Dict[str, Any]:
         """Resolve a market whether user passes CCXT symbol or Bybit id.
 
@@ -370,6 +387,9 @@ class BybitVWAPStrategy:
 
                 for key in closed_keys:
                     self.state["positions"][key]["active"] = False
+                    # Если позиции нет, а entry_order_id уже не в стакане — очищаем,
+                    # иначе check_and_handle_executions может зациклиться на «исполнено».
+                    self.state["positions"][key].pop("entry_order_id", None)
 
                 if closed_keys:
                     self.save_state()
@@ -381,6 +401,10 @@ class BybitVWAPStrategy:
     def update_tp_sl_for_all(self, vwap: float):
         active_positions = [p for p in self.state["positions"].values() if p.get("active", False)]
         if not active_positions:
+            return
+        # Не ставим TP/SL, если на бирже фактически нет позиции (защита от ложных активных флагов)
+        if not self._has_exchange_position():
+            logger.info("TP/SL не выставляем — на бирже нет позиции")
             return
 
         levels = self.get_levels(vwap)
@@ -529,23 +553,36 @@ class BybitVWAPStrategy:
                 if oid in open_ids:
                     continue
 
-                # Not open anymore: verify it wasn't just canceled
+                # Ордер не в открытых: проверяем, был ли он исполнен или отменён
                 try:
                     o = self.exchange.fetch_order(oid, self.symbol)
                     status = (o.get("status") or "").lower()
                     filled = float(o.get("filled") or 0)
-                    if status == "closed" and filled > 0:
-                        pos["active"] = True
-                        executed = True
-                        logger.info(f"ВХОД {key} ИСПОЛНЕН")
-                    elif status == "canceled":
+                    if status == "closed":
+                        if filled > 0:
+                            # Доп. защита: подтверждаем наличие позиции на бирже
+                            if self._has_exchange_position():
+                                pos["active"] = True
+                                executed = True
+                                logger.info(f"ВХОД {key} ИСПОЛНЕН")
+                            else:
+                                logger.warning(
+                                    f"Ордер {key} закрыт с filled={filled}, но позиция не обнаружена — не активируем флаг"
+                                )
+                                pos.pop("entry_order_id", None)
+                        else:
+                            # Закрыт без исполнения
+                            pos.pop("entry_order_id", None)
+                            logger.info(f"ВХОД {key} ЗАКРЫТ БЕЗ ИСПОЛНЕНИЯ")
+                    elif status in {"canceled", "rejected", "expired"}:
                         pos.pop("entry_order_id", None)
-                        logger.info(f"ВХОД {key} ОТМЕНЁН")
+                        logger.info(f"ВХОД {key} ОТМЕНЁН ({status})")
+                    else:
+                        # Неизвестный статус — не делаем предположений, просто подождём следующего цикла
+                        logger.info(f"ВХОД {key}: статус ордера '{status}', ждём подтверждения")
                 except Exception:
-                    # Fallback to previous behavior
-                    pos["active"] = True
-                    executed = True
-                    logger.info(f"ВХОД {key} ИСПОЛНЕН (без подтверждения)")
+                    # ВАЖНО: не ставим active без подтверждения — иначе зацикливание TP/SL.
+                    logger.warning(f"Не удалось подтвердить статус входа {key} (orderId={oid}) — флаг не меняем")
 
             if executed:
                 self.update_tp_sl_for_all(vwap)
