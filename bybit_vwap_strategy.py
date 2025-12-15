@@ -474,6 +474,31 @@ class BybitVWAPStrategy:
                     self.save_state()
                     logger.info(f"Сброшено {len(closed_keys)} флагов/уровней (позиция закрыта)")
 
+                # Доп. очистка: если позиции нет, но в state остались entry_order_id, которых уже нет на бирже,
+                # бот может «залипнуть» и перестать ставить новые лимитки. Чистим осиротевшие ID.
+                try:
+                    open_orders = self.exchange.fetch_open_orders(self.symbol)
+                    open_ids = {o.get("id") for o in open_orders if o.get("id")}
+                except Exception:
+                    open_ids = None
+
+                if open_ids is not None:
+                    orphaned = 0
+                    for key, pos in self.state["positions"].items():
+                        if not isinstance(pos, dict):
+                            continue
+                        oid = pos.get("entry_order_id")
+                        if not oid:
+                            continue
+                        if oid in open_ids:
+                            continue
+                        pos.pop("entry_order_id", None)
+                        pos.pop("entry_order_ts", None)
+                        orphaned += 1
+                    if orphaned:
+                        self.save_state()
+                        logger.info(f"Очищено {orphaned} осиротевших entry_order_id (позиции нет)")
+
         except Exception as e:
             logger.error(f"Ошибка синхронизации: {e}")
 
@@ -684,6 +709,7 @@ class BybitVWAPStrategy:
 
             open_orders = self.exchange.fetch_open_orders(self.symbol)
             open_ids = {o["id"] for o in open_orders}
+            has_pos = self._has_exchange_position()
 
             for key, pos in list(self.state["positions"].items()):
                 if pos.get("active") or "entry_order_id" not in pos:
@@ -729,6 +755,11 @@ class BybitVWAPStrategy:
                     if self._is_order_not_found(e):
                         # если ордер не существует — очищаем, иначе зависнем навсегда
                         logger.warning(f"{key}: входной ордер {oid} не найден — очищаем entry_order_id")
+                        pos.pop("entry_order_id", None)
+                        pos.pop("entry_order_ts", None)
+                    elif not has_pos and oid not in open_ids:
+                        # если позиции нет и ордера нет в open — очищаем, чтобы не залипнуть на старом state
+                        logger.warning(f"{key}: позиции нет, ордер {oid} не подтверждается — очищаем entry_order_id")
                         pos.pop("entry_order_id", None)
                         pos.pop("entry_order_ts", None)
                     else:
