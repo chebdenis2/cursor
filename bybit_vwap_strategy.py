@@ -95,6 +95,20 @@ class BybitVWAPStrategy:
             # В случае ошибки не делаем ложных выводов
             return False
 
+    @staticmethod
+    def _is_order_not_found(err: Exception) -> bool:
+        """Грубая эвристика: Bybit/CCXT часто возвращают 'not found' разными текстами/кодами."""
+        s = str(err).lower()
+        needles = [
+            "order not found",
+            "not found",
+            "does not exist",
+            "unknown order",
+            "110001",  # bybit: order not exists (часто)
+            "order does not exist",
+        ]
+        return any(n in s for n in needles)
+
     def _sync_fills_from_trades(self) -> bool:
         """Подтверждает исполнения входных ордеров через историю сделок.
 
@@ -553,6 +567,9 @@ class BybitVWAPStrategy:
         except Exception:
             open_ids = set()
 
+        now_ms = int(time.time() * 1000)
+        stale_ms = 3 * 60_000  # если статус не подтверждается слишком долго — считаем ID протухшим
+
         # Cancel old entry orders stored in state
         for key, pos in self.state["positions"].items():
             if pos.get("active", False):
@@ -568,6 +585,7 @@ class BybitVWAPStrategy:
                         self.exchange.cancel_order(order_id, self.symbol)
                         logger.info(f"ОТМЕНЕНА СТАРАЯ ЛИМИТКА {key}: {order_id}")
                         pos.pop("entry_order_id", None)
+                        pos.pop("entry_order_ts", None)
                     except Exception:
                         # Не удаляем entry_order_id, пока не подтвердим статус
                         logger.warning(f"Не удалось отменить лимитку {key}: {order_id} — статус не подтверждён")
@@ -582,14 +600,29 @@ class BybitVWAPStrategy:
                             pos["filled"] = True
                             pos["filled_entry_order_id"] = order_id
                             pos.pop("entry_order_id", None)
+                            pos.pop("entry_order_ts", None)
                             logger.info(f"ВХОД {key} ПОДТВЕРЖДЁН ПРИ ПЕРЕВЫСТАВЛЕНИИ")
                         elif status in {"canceled", "rejected", "expired"} or (status == "closed" and filled <= 0):
                             pos.pop("entry_order_id", None)
+                            pos.pop("entry_order_ts", None)
                         else:
                             # неизвестно — не перевыставляем, чтобы не дублировать
                             logger.info(f"{key}: ордер {order_id} не в open, статус '{status}' — ждём подтверждения")
-                    except Exception:
-                        logger.warning(f"{key}: не удалось получить статус ордера {order_id} — ждём подтверждения")
+                    except Exception as e:
+                        # ВАЖНО: если биржа говорит "ордера нет" — чистим ID, иначе бот зависнет и перестанет ставить лимитки.
+                        if self._is_order_not_found(e):
+                            logger.warning(f"{key}: ордер {order_id} не найден — очищаем entry_order_id")
+                            pos.pop("entry_order_id", None)
+                            pos.pop("entry_order_ts", None)
+                        else:
+                            # если ID очень старый и статус так и не подтверждается — считаем его протухшим
+                            ts = int(pos.get("entry_order_ts") or 0)
+                            if ts and (now_ms - ts) > stale_ms:
+                                logger.warning(f"{key}: статус ордера {order_id} не подтверждается > {stale_ms/60000:.0f} мин — очищаем")
+                                pos.pop("entry_order_id", None)
+                                pos.pop("entry_order_ts", None)
+                            else:
+                                logger.warning(f"{key}: не удалось получить статус ордера {order_id} — ждём подтверждения")
 
         placed = 0
         for i, price in enumerate(entry_levels):
@@ -631,6 +664,7 @@ class BybitVWAPStrategy:
                 pos["entry_price"] = price
                 pos["qty"] = qty
                 pos["entry_order_id"] = o["id"]
+                pos["entry_order_ts"] = now_ms
                 self.state["positions"][key] = pos
                 logger.info(f"НОВАЯ ЛИМИТКА {side} {qty:.6f} @ {price:.1f} | {key}")
                 placed += 1
@@ -690,11 +724,17 @@ class BybitVWAPStrategy:
                     else:
                         # Неизвестный статус — не делаем предположений, просто подождём следующего цикла
                         logger.info(f"ВХОД {key}: статус ордера '{status}', ждём подтверждения")
-                except Exception:
+                except Exception as e:
                     # ВАЖНО: не ставим active без подтверждения — иначе зацикливание TP/SL.
-                    logger.warning(
-                        f"Не удалось подтвердить статус входа {key} (orderId={oid}) — ждём подтверждения по сделкам"
-                    )
+                    if self._is_order_not_found(e):
+                        # если ордер не существует — очищаем, иначе зависнем навсегда
+                        logger.warning(f"{key}: входной ордер {oid} не найден — очищаем entry_order_id")
+                        pos.pop("entry_order_id", None)
+                        pos.pop("entry_order_ts", None)
+                    else:
+                        logger.warning(
+                            f"Не удалось подтвердить статус входа {key} (orderId={oid}) — ждём подтверждения по сделкам"
+                        )
 
             if executed:
                 self.update_tp_sl_for_all(vwap)
