@@ -149,6 +149,15 @@ class BybitVWAPStrategy:
                 self.state = {"positions": {}, "last_candle_time": None}
         else:
             self.state = {"positions": {}, "last_candle_time": None}
+        # Миграция/нормализация полей состояния
+        if "positions" not in self.state or not isinstance(self.state["positions"], dict):
+            self.state["positions"] = {}
+        for _, pos in self.state["positions"].items():
+            if not isinstance(pos, dict):
+                continue
+            if "filled" not in pos:
+                # если уровень уже активен, считаем что вход был (иначе на рестарте будет ставить лимитки снова)
+                pos["filled"] = bool(pos.get("active", False))
 
     def save_state(self):
         with open(self.state_file, "w", encoding="utf-8") as f:
@@ -483,6 +492,13 @@ class BybitVWAPStrategy:
     def place_all_entry_orders(self, entry_levels: List[float]):
         logger.info("Расстановка новых лимиток (с удалением старых по ID)")
 
+        # Снимем текущие открытые ордера, чтобы не «терять» факт исполнения при перевыставлении
+        try:
+            open_orders = self.exchange.fetch_open_orders(self.symbol)
+            open_ids = {o.get("id") for o in open_orders if o.get("id")}
+        except Exception:
+            open_ids = set()
+
         # Cancel old entry orders stored in state
         for key, pos in self.state["positions"].items():
             if pos.get("active", False):
@@ -492,19 +508,43 @@ class BybitVWAPStrategy:
                 continue
             order_id = pos.get("entry_order_id")
             if order_id:
-                try:
-                    self.exchange.cancel_order(order_id, self.symbol)
-                    logger.info(f"ОТМЕНЕНА СТАРАЯ ЛИМИТКА {key}: {order_id}")
-                except Exception:
-                    pass
-                finally:
-                    pos.pop("entry_order_id", None)
+                # Отменяем только если ордер действительно в открытых.
+                if order_id in open_ids:
+                    try:
+                        self.exchange.cancel_order(order_id, self.symbol)
+                        logger.info(f"ОТМЕНЕНА СТАРАЯ ЛИМИТКА {key}: {order_id}")
+                        pos.pop("entry_order_id", None)
+                    except Exception:
+                        # Не удаляем entry_order_id, пока не подтвердим статус
+                        logger.warning(f"Не удалось отменить лимитку {key}: {order_id} — статус не подтверждён")
+                else:
+                    # Ордер не в открытых: проверяем, не был ли он исполнен/отменён.
+                    try:
+                        o = self.exchange.fetch_order(order_id, self.symbol)
+                        status = (o.get("status") or "").lower()
+                        filled = float(o.get("filled") or 0)
+                        if status == "closed" and filled > 0 and self._has_exchange_position():
+                            pos["active"] = True
+                            pos["filled"] = True
+                            pos["filled_entry_order_id"] = order_id
+                            pos.pop("entry_order_id", None)
+                            logger.info(f"ВХОД {key} ПОДТВЕРЖДЁН ПРИ ПЕРЕВЫСТАВЛЕНИИ")
+                        elif status in {"canceled", "rejected", "expired"} or (status == "closed" and filled <= 0):
+                            pos.pop("entry_order_id", None)
+                        else:
+                            # неизвестно — не перевыставляем, чтобы не дублировать
+                            logger.info(f"{key}: ордер {order_id} не в open, статус '{status}' — ждём подтверждения")
+                    except Exception:
+                        logger.warning(f"{key}: не удалось получить статус ордера {order_id} — ждём подтверждения")
 
         placed = 0
         for i, price in enumerate(entry_levels):
             key = f"level_{i + 1}"
             existing = self.state["positions"].get(key, {})
             if existing.get("active", False) or existing.get("filled", False):
+                continue
+            # Если по уровню есть «неподтверждённый» entry_order_id, не создаём новый
+            if existing.get("entry_order_id"):
                 continue
 
             # entry_size_usdt is intended as margin; margin requirement is ~entry_size_usdt (notional/leverage)
@@ -528,15 +568,16 @@ class BybitVWAPStrategy:
                     price=price,
                     params={"postOnly": True, "clientOrderId": client_order_id},
                 )
-                self.state["positions"][key] = {
-                    "entry_price": price,
-                    "qty": qty,
-                    "entry_order_id": o["id"],
-                    "tp_order_id": None,
-                    "sl_order_id": None,
-                    "active": False,
-                    "filled": False,
-                }
+                # Важно: не перезатираем существующий pos целиком, чтобы не терять filled/active при гонках.
+                pos = self.state["positions"].get(key, {}) if isinstance(self.state["positions"].get(key, {}), dict) else {}
+                pos.setdefault("tp_order_id", None)
+                pos.setdefault("sl_order_id", None)
+                pos.setdefault("active", False)
+                pos.setdefault("filled", False)
+                pos["entry_price"] = price
+                pos["qty"] = qty
+                pos["entry_order_id"] = o["id"]
+                self.state["positions"][key] = pos
                 logger.info(f"НОВАЯ ЛИМИТКА {side} {qty:.6f} @ {price:.1f} | {key}")
                 placed += 1
             except Exception as e:
