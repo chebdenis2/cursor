@@ -95,6 +95,57 @@ class BybitVWAPStrategy:
             # В случае ошибки не делаем ложных выводов
             return False
 
+    def _sync_fills_from_trades(self) -> bool:
+        """Подтверждает исполнения входных ордеров через историю сделок.
+
+        Это надёжнее, чем ориентироваться только на исчезновение из open orders или fetch_order(),
+        которое у Bybit/CCXT иногда может падать/возвращать неполные данные.
+        """
+        since = int(self.state.get("last_trade_ts") or 0)
+        if since > 0:
+            since = max(0, since - 60_000)  # небольшой overlap
+
+        try:
+            trades = self.exchange.fetch_my_trades(self.symbol, since=since, limit=200, params={"type": "swap"})
+        except Exception:
+            try:
+                trades = self.exchange.fetch_my_trades(self.symbol, since=since, limit=200)
+            except Exception:
+                return False
+
+        max_ts = int(self.state.get("last_trade_ts") or 0)
+        updated = False
+
+        for t in trades or []:
+            ts = int(t.get("timestamp") or 0)
+            if ts > max_ts:
+                max_ts = ts
+            order_id = t.get("order") or (t.get("info") or {}).get("orderId")
+            if not order_id:
+                continue
+
+            for key, pos in self.state.get("positions", {}).items():
+                if not isinstance(pos, dict):
+                    continue
+                if pos.get("active") or pos.get("filled"):
+                    continue
+                if pos.get("entry_order_id") != order_id:
+                    continue
+
+                pos["active"] = True
+                pos["filled"] = True
+                pos["filled_entry_order_id"] = order_id
+                pos.pop("entry_order_id", None)
+                logger.info(f"ВХОД {key} ПОДТВЕРЖДЁН ПО СДЕЛКАМ (orderId={order_id})")
+                updated = True
+                break
+
+        if max_ts and max_ts != int(self.state.get("last_trade_ts") or 0):
+            self.state["last_trade_ts"] = max_ts
+            self.save_state()
+
+        return updated
+
     def _resolve_market(self, symbol: str) -> Dict[str, Any]:
         """Resolve a market whether user passes CCXT symbol or Bybit id.
 
@@ -152,6 +203,9 @@ class BybitVWAPStrategy:
         # Миграция/нормализация полей состояния
         if "positions" not in self.state or not isinstance(self.state["positions"], dict):
             self.state["positions"] = {}
+        if "last_trade_ts" not in self.state:
+            # ms timestamp для инкрементальной синхронизации сделок
+            self.state["last_trade_ts"] = 0
         for _, pos in self.state["positions"].items():
             if not isinstance(pos, dict):
                 continue
@@ -590,6 +644,10 @@ class BybitVWAPStrategy:
     def check_and_handle_executions(self, vwap: float):
         executed = False
         try:
+            # Сначала подтверждаем исполнения по истории сделок (самый надёжный источник для Bybit)
+            if self._sync_fills_from_trades():
+                executed = True
+
             open_orders = self.exchange.fetch_open_orders(self.symbol)
             open_ids = {o["id"] for o in open_orders}
 
@@ -634,7 +692,9 @@ class BybitVWAPStrategy:
                         logger.info(f"ВХОД {key}: статус ордера '{status}', ждём подтверждения")
                 except Exception:
                     # ВАЖНО: не ставим active без подтверждения — иначе зацикливание TP/SL.
-                    logger.warning(f"Не удалось подтвердить статус входа {key} (orderId={oid}) — флаг не меняем")
+                    logger.warning(
+                        f"Не удалось подтвердить статус входа {key} (orderId={oid}) — ждём подтверждения по сделкам"
+                    )
 
             if executed:
                 self.update_tp_sl_for_all(vwap)
