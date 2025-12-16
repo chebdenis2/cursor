@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+.venv/
+strategy_state_*.json
+strategy_config_*.json
