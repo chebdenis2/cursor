@@ -112,6 +112,80 @@ class BybitVWAPStrategy:
         except Exception:
             return 0.0
 
+    def _detect_close_reason(self, close_order_ids: Dict[str, set]) -> Optional[str]:
+        """Определяет причину закрытия (TP/SL) по последним сделкам.
+
+        close_order_ids: {"tp": {ids}, "sl": {ids}}
+        Возвращает: "TP" | "SL" | None
+        """
+        tp_ids = close_order_ids.get("tp") or set()
+        sl_ids = close_order_ids.get("sl") or set()
+        if not tp_ids and not sl_ids:
+            return None
+
+        since = int(self.state.get("last_close_check_ts") or 0)
+        if since > 0:
+            since = max(0, since - 120_000)  # overlap 2 минуты
+
+        try:
+            trades = self.exchange.fetch_my_trades(self.symbol, since=since, limit=200, params={"type": "swap"})
+        except Exception:
+            try:
+                trades = self.exchange.fetch_my_trades(self.symbol, since=since, limit=200)
+            except Exception:
+                return None
+
+        last_tp_ts = -1
+        last_sl_ts = -1
+        max_ts = int(self.state.get("last_close_check_ts") or 0)
+
+        for t in trades or []:
+            info = t.get("info") or {}
+            ts = int(
+                t.get("timestamp")
+                or info.get("execTime")
+                or info.get("tradeTimeMs")
+                or info.get("ts")
+                or 0
+            )
+            if ts > max_ts:
+                max_ts = ts
+            oid = t.get("order") or info.get("orderId") or info.get("orderID")
+            if not oid:
+                continue
+            oid = str(oid)
+            if oid in tp_ids and ts > last_tp_ts:
+                last_tp_ts = ts
+            if oid in sl_ids and ts > last_sl_ts:
+                last_sl_ts = ts
+
+        if max_ts and max_ts != int(self.state.get("last_close_check_ts") or 0):
+            self.state["last_close_check_ts"] = max_ts
+            self.save_state()
+
+        if last_tp_ts < 0 and last_sl_ts < 0:
+            return None
+        return "SL" if last_sl_ts > last_tp_ts else "TP"
+
+    def _is_pause_released(self, price: float, vwap: float) -> bool:
+        """Возобновление после SL: только когда цена коснётся уровня 1 противоположной стороны."""
+        if not self.state.get("trading_paused"):
+            return True
+        if not (price == price) or price <= 0 or not (vwap == vwap) or vwap <= 0:
+            return False
+        p = float(self.levels_pct[0]) if self.levels_pct else 0.0
+        if p <= 0:
+            return False
+
+        if self.direction == "LONG":
+            # после SL в LONG ждём касания SHORT level_1 (выше VWAP)
+            opposite_l1 = vwap * (1 + p / 100)
+            return price >= opposite_l1
+        else:
+            # после SL в SHORT ждём касания LONG level_1 (ниже VWAP)
+            opposite_l1 = vwap * (1 - p / 100)
+            return price <= opposite_l1
+
     @staticmethod
     def _is_order_not_found(err: Exception) -> bool:
         """Грубая эвристика: Bybit/CCXT часто возвращают 'not found' разными текстами/кодами."""
@@ -271,6 +345,15 @@ class BybitVWAPStrategy:
         if "last_trade_ts" not in self.state:
             # ms timestamp для инкрементальной синхронизации сделок
             self.state["last_trade_ts"] = 0
+        if "trading_paused" not in self.state:
+            self.state["trading_paused"] = False
+        if "pause_reason" not in self.state:
+            self.state["pause_reason"] = None
+        if "paused_at" not in self.state:
+            self.state["paused_at"] = None
+        if "last_close_check_ts" not in self.state:
+            # ms timestamp для детекта закрытия по TP/SL
+            self.state["last_close_check_ts"] = 0
         for _, pos in self.state["positions"].items():
             if not isinstance(pos, dict):
                 continue
@@ -307,6 +390,7 @@ class BybitVWAPStrategy:
             "leverage",
             "anchor_period",
             "approach_distance_pct",
+            "pause_on_sl",
         ]
         cfg = {k: getattr(self, k) for k in attrs if hasattr(self, k)}
         with open(self.config_file, "w", encoding="utf-8") as f:
@@ -326,6 +410,7 @@ class BybitVWAPStrategy:
         self.leverage = int(input("Плечо (ум. 6): ") or 6)
         self.approach_distance_pct = float(input("Расстояние входа % (ум. 0.1): ") or 0.1)
         self.anchor_period = input("Якорь Session/Week/Month/Year (ум. Session): ") or "Session"
+        self.pause_on_sl = (input("Пауза после SL? (y/n, ум. n): ") or "n").lower().startswith("y")
         self.save_config()
 
     def set_margin_and_leverage(self):
@@ -574,11 +659,17 @@ class BybitVWAPStrategy:
 
             elif total_qty < 1e-6:
                 closed_keys = []
+                close_order_ids = {"tp": set(), "sl": set()}
                 # Позиции на бирже нет: считаем цикл завершённым, сбрасываем уровни,
                 # чтобы входы могли ставиться заново ТОЛЬКО после закрытия (TP/SL).
                 for key, pos in self.state["positions"].items():
                     if pos.get("active", False) or pos.get("filled", False):
                         logger.info(f"НА БИРЖЕ НЕТ ПОЗИЦИИ — СБРАСЫВАЕМ ЦИКЛ {key}")
+                        # Собираем id ордеров, чтобы понять было это TP или SL
+                        if pos.get("tp_order_id"):
+                            close_order_ids["tp"].add(str(pos["tp_order_id"]))
+                        if pos.get("sl_order_id"):
+                            close_order_ids["sl"].add(str(pos["sl_order_id"]))
                         for oid_key in ["tp_order_id", "sl_order_id"]:
                             order_id = pos.get(oid_key)
                             if order_id:
@@ -594,6 +685,16 @@ class BybitVWAPStrategy:
                         closed_keys.append(key)
 
                 if closed_keys:
+                    # Если цикл завершился, пробуем понять TP или SL, и при SL (если включено) ставим паузу торговли
+                    reason = self._detect_close_reason(close_order_ids)
+                    if reason == "SL" and getattr(self, "pause_on_sl", False):
+                        self.state["trading_paused"] = True
+                        self.state["pause_reason"] = "SL"
+                        self.state["paused_at"] = datetime.utcnow().isoformat()
+                        logger.warning("ТОРГОВЛЯ НА ПАУЗЕ: сработал SL. Возобновим после касания уровня 1 противоположной стороны.")
+                    elif reason == "TP":
+                        # если закрыто по TP — паузу не ставим
+                        self.state["pause_reason"] = "TP"
                     self.save_state()
                     logger.info(f"Сброшено {len(closed_keys)} флагов/уровней (позиция закрыта)")
 
@@ -984,6 +1085,34 @@ class BybitVWAPStrategy:
 
                 levels = self.get_levels(vwap)
 
+                # Пауза после SL (если включено): возобновляем только по касанию противоположного L1
+                if self.state.get("trading_paused"):
+                    if self._is_pause_released(price, vwap):
+                        self.state["trading_paused"] = False
+                        self.state["pause_reason"] = None
+                        self.state["paused_at"] = None
+                        self.save_state()
+                        logger.warning("ПАУЗА СНЯТА: условие возобновления выполнено.")
+                    else:
+                        # На паузе не выставляем новые входы
+                        # (управление выходом не требуется, т.к. позиция уже закрыта по SL)
+                        bal = self.get_balance()
+                        unreal = self.get_unrealized_pnl()
+                        print(f"\n{'=' * 70}")
+                        print(
+                            f"{datetime.now():%H:%M:%S} | {self.base_symbol} | {self.direction} | "
+                            f"ПАУЗА после SL | Цена: {self._fmt_price(price)} | VWAP: {self._fmt_price(vwap)}"
+                        )
+                        print(f"Входы: {[self._fmt_price(x) for x in levels['entry_levels']]}")
+                        print(
+                            f"TP: {self._fmt_price(levels['tp_price'])} | "
+                            f"SL: {self._fmt_price(levels['sl_price'])} ← Conditional"
+                        )
+                        print(f"Активно: — | Баланс: {bal:.2f} | Unreal: {unreal:+.2f}")
+                        print(f"{'=' * 70}")
+                        time.sleep(self.poll_interval)
+                        continue
+
                 cur_candle = klines[-1]["timestamp"].replace(second=0, microsecond=0)
                 if self.state.get("last_candle_time") != cur_candle.isoformat():
                     self.state["last_candle_time"] = cur_candle.isoformat()
@@ -996,7 +1125,8 @@ class BybitVWAPStrategy:
                         self.update_tp_sl_for_all(vwap)
 
                     # На каждой новой свече принудительно перевыставляем входные лимитки
-                    self.place_all_entry_orders(levels["entry_levels"])
+                    if not self.state.get("trading_paused"):
+                        self.place_all_entry_orders(levels["entry_levels"])
 
                 if last_vwap and abs(vwap - last_vwap) / vwap > 0.0005:
                     if any(p.get("active", False) for p in self.state["positions"].values()):
