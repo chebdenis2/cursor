@@ -438,8 +438,18 @@ class BybitVWAPStrategy:
                 for c in ohlcv
             ]
             klines.sort(key=lambda x: x["timestamp"])
-            self.klines_data = klines
-            return klines
+            # Защита: если биржа вернула «нулевые» свечи (нет торгов/нет данных) — не торгуем
+            valid = [
+                k
+                for k in klines
+                if k["open"] > 0
+                and k["high"] > 0
+                and k["low"] > 0
+                and k["close"] > 0
+                and k["high"] >= k["low"]
+            ]
+            self.klines_data = valid
+            return valid
         except Exception:
             return []
 
@@ -458,9 +468,12 @@ class BybitVWAPStrategy:
         period = [k for k in klines if k["timestamp"] >= self.last_anchor_time]
         self.cum_pv = sum(((k["high"] + k["low"] + k["close"]) / 3) * k["volume"] for k in period)
         self.cum_vol = sum(k["volume"] for k in period)
-        return self.cum_pv / self.cum_vol if self.cum_vol > 0 else float("nan")
+        v = self.cum_pv / self.cum_vol if self.cum_vol > 0 else float("nan")
+        return v if v == v and v > 0 else float("nan")
 
     def get_levels(self, vwap: float) -> Dict[str, Any]:
+        if not (vwap == vwap) or vwap <= 0:
+            return {"entry_levels": [], "tp_price": float("nan"), "sl_price": float("nan")}
         if self.direction == "LONG":
             entry = [vwap * (1 - p / 100) for p in self.levels_pct]
             tp = vwap * (1 + self.tp_pct / 100)
