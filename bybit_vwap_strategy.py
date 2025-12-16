@@ -160,6 +160,15 @@ class BybitVWAPStrategy:
 
         return updated
 
+    def _mark_level_filled(self, key: str, pos: Dict[str, Any], order_id: str, reason: str):
+        """Единая точка фиксации 'уровень сработал'."""
+        pos["active"] = True
+        pos["filled"] = True
+        pos["filled_entry_order_id"] = order_id
+        pos.pop("entry_order_id", None)
+        pos.pop("entry_order_ts", None)
+        logger.info(f"ВХОД {key} ПОДТВЕРЖДЁН ({reason})")
+
     def _resolve_market(self, symbol: str) -> Dict[str, Any]:
         """Resolve a market whether user passes CCXT symbol or Bybit id.
 
@@ -588,8 +597,10 @@ class BybitVWAPStrategy:
         # Снимем текущие открытые ордера, чтобы не «терять» факт исполнения при перевыставлении
         try:
             open_orders = self.exchange.fetch_open_orders(self.symbol)
-            open_ids = {o.get("id") for o in open_orders if o.get("id")}
+            open_by_id = {o.get("id"): o for o in open_orders if o.get("id")}
+            open_ids = set(open_by_id.keys())
         except Exception:
+            open_by_id = {}
             open_ids = set()
 
         now_ms = int(time.time() * 1000)
@@ -606,6 +617,20 @@ class BybitVWAPStrategy:
             if order_id:
                 # Отменяем только если ордер действительно в открытых.
                 if order_id in open_ids:
+                    # Если ордер уже частично/полностью исполнился, НЕ перевыставляем его как вход:
+                    # считаем уровень сработавшим и отменяем остаток.
+                    try:
+                        o = open_by_id.get(order_id) or {}
+                        filled = float(o.get("filled") or 0)
+                    except Exception:
+                        filled = 0.0
+                    if filled > 0:
+                        self._mark_level_filled(key, pos, order_id, f"filled>0 в open_orders ({filled})")
+                        try:
+                            self.exchange.cancel_order(order_id, self.symbol)
+                        except Exception:
+                            pass
+                        continue
                     try:
                         self.exchange.cancel_order(order_id, self.symbol)
                         logger.info(f"ОТМЕНЕНА СТАРАЯ ЛИМИТКА {key}: {order_id}")
@@ -620,13 +645,9 @@ class BybitVWAPStrategy:
                         o = self.exchange.fetch_order(order_id, self.symbol)
                         status = (o.get("status") or "").lower()
                         filled = float(o.get("filled") or 0)
-                        if status == "closed" and filled > 0 and self._has_exchange_position():
-                            pos["active"] = True
-                            pos["filled"] = True
-                            pos["filled_entry_order_id"] = order_id
-                            pos.pop("entry_order_id", None)
-                            pos.pop("entry_order_ts", None)
-                            logger.info(f"ВХОД {key} ПОДТВЕРЖДЁН ПРИ ПЕРЕВЫСТАВЛЕНИИ")
+                        # Важно: уровень считается сработавшим, если filled > 0, даже если ордер ещё может быть open/partial.
+                        if filled > 0 and self._has_exchange_position():
+                            self._mark_level_filled(key, pos, order_id, f"fetch_order filled={filled} status={status}")
                         elif status in {"canceled", "rejected", "expired"} or (status == "closed" and filled <= 0):
                             pos.pop("entry_order_id", None)
                             pos.pop("entry_order_ts", None)
@@ -708,7 +729,8 @@ class BybitVWAPStrategy:
                 executed = True
 
             open_orders = self.exchange.fetch_open_orders(self.symbol)
-            open_ids = {o["id"] for o in open_orders}
+            open_by_id = {o.get("id"): o for o in open_orders if o.get("id")}
+            open_ids = set(open_by_id.keys())
             has_pos = self._has_exchange_position()
 
             for key, pos in list(self.state["positions"].items()):
@@ -717,6 +739,19 @@ class BybitVWAPStrategy:
 
                 oid = pos["entry_order_id"]
                 if oid in open_ids:
+                    # Частичное исполнение: если filled > 0, уровень считаем сработавшим и отменяем остаток.
+                    try:
+                        o = open_by_id.get(oid) or {}
+                        filled = float(o.get("filled") or 0)
+                    except Exception:
+                        filled = 0.0
+                    if filled > 0 and has_pos:
+                        self._mark_level_filled(key, pos, oid, f"partial fill в open_orders ({filled})")
+                        try:
+                            self.exchange.cancel_order(oid, self.symbol)
+                        except Exception:
+                            pass
+                        executed = True
                     continue
 
                 # Ордер не в открытых: проверяем, был ли он исполнен или отменён
@@ -728,11 +763,7 @@ class BybitVWAPStrategy:
                         if filled > 0:
                             # Доп. защита: подтверждаем наличие позиции на бирже
                             if self._has_exchange_position():
-                                pos["active"] = True
-                                pos["filled"] = True
-                                # чтобы не зацикливаться и не пытаться отменять "закрытый" ордер как входной
-                                pos["filled_entry_order_id"] = oid
-                                pos.pop("entry_order_id", None)
+                                self._mark_level_filled(key, pos, oid, f"fetch_order closed filled={filled}")
                                 executed = True
                                 logger.info(f"ВХОД {key} ИСПОЛНЕН")
                             else:
