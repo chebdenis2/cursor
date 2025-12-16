@@ -189,6 +189,28 @@ class BybitVWAPStrategy:
         pos.pop("entry_order_ts", None)
         logger.info(f"ВХОД {key} ПОДТВЕРЖДЁН ({reason})")
 
+    def _fmt_price(self, x: float) -> str:
+        """Форматирует цену по precision рынка (важно для мелких цен типа 0.0066)."""
+        try:
+            if x is None or not (x == x) or x <= 0:
+                return "—"
+            return self.exchange.price_to_precision(self.symbol, float(x))
+        except Exception:
+            try:
+                return f"{float(x):.8f}".rstrip("0").rstrip(".")
+            except Exception:
+                return str(x)
+
+    def _fmt_amount(self, x: float) -> str:
+        """Форматирует количество по precision рынка."""
+        try:
+            return self.exchange.amount_to_precision(self.symbol, float(x))
+        except Exception:
+            try:
+                return f"{float(x):.8f}".rstrip("0").rstrip(".")
+            except Exception:
+                return str(x)
+
     def _resolve_market(self, symbol: str) -> Dict[str, Any]:
         """Resolve a market whether user passes CCXT symbol or Bybit id.
 
@@ -613,11 +635,12 @@ class BybitVWAPStrategy:
             return
 
         levels = self.get_levels(vwap)
-        tp_price = round(levels["tp_price"], 1)
-        sl_price = round(levels["sl_price"], 1)
+        # Никаких round(..., 1) — для мелких цен это превращает всё в 0.0
+        tp_price_str = self._fmt_price(levels["tp_price"])
+        sl_price_str = self._fmt_price(levels["sl_price"])
         side = "Sell" if self.direction == "LONG" else "Buy"
 
-        logger.info(f"ПЕРЕУСТАНОВКА TP/SL → TP={tp_price} | SL={sl_price}")
+        logger.info(f"ПЕРЕУСТАНОВКА TP/SL → TP={tp_price_str} | SL={sl_price_str}")
 
         # На всякий случай: убираем выходные ордера, созданные этим запуском,
         # даже если state не полностью их отслеживает.
@@ -645,8 +668,8 @@ class BybitVWAPStrategy:
             qty = str(pos["qty"])
 
             for target_price, direction, label in [
-                (tp_price, 1 if self.direction == "LONG" else 2, "TP"),
-                (sl_price, 2 if self.direction == "LONG" else 1, "SL"),
+                (tp_price_str, 1 if self.direction == "LONG" else 2, "TP"),
+                (sl_price_str, 2 if self.direction == "LONG" else 1, "SL"),
             ]:
                 try:
                     client_id = f"{self.client_prefix}_{label}{key[-1]}_{int(time.time() * 1000)}"
@@ -804,7 +827,7 @@ class BybitVWAPStrategy:
                 pos["entry_order_id"] = o["id"]
                 pos["entry_order_ts"] = now_ms
                 self.state["positions"][key] = pos
-                logger.info(f"НОВАЯ ЛИМИТКА {side} {qty:.6f} @ {price:.1f} | {key}")
+                logger.info(f"НОВАЯ ЛИМИТКА {side} {self._fmt_amount(qty)} @ {self._fmt_price(price)} | {key}")
                 placed += 1
             except Exception as e:
                 logger.error(f"Ошибка создания {key}: {e}")
@@ -990,10 +1013,14 @@ class BybitVWAPStrategy:
 
                 print(f"\n{'=' * 70}")
                 print(
-                    f"{datetime.now():%H:%M:%S} | {self.base_symbol} | {self.direction} | Цена: {price:.1f} | VWAP: {vwap:.1f}"
+                    f"{datetime.now():%H:%M:%S} | {self.base_symbol} | {self.direction} | "
+                    f"Цена: {self._fmt_price(price)} | VWAP: {self._fmt_price(vwap)}"
                 )
-                print(f"Входы: {[f'{x:.1f}' for x in levels['entry_levels']]}")
-                print(f"TP: {levels['tp_price']:.1f} | SL: {levels['sl_price']:.1f} ← Conditional")
+                print(f"Входы: {[self._fmt_price(x) for x in levels['entry_levels']]}")
+                print(
+                    f"TP: {self._fmt_price(levels['tp_price'])} | "
+                    f"SL: {self._fmt_price(levels['sl_price'])} ← Conditional"
+                )
                 print(f"Активно: {active or '—'} | Баланс: {bal:.2f} | Unreal: {unreal:+.2f}")
                 print(f"{'=' * 70}")
 
