@@ -95,6 +95,23 @@ class BybitVWAPStrategy:
             # В случае ошибки не делаем ложных выводов
             return False
 
+    def _get_exchange_position_qty(self) -> float:
+        """Возвращает текущий размер позиции (contracts) по направлению стратегии."""
+        try:
+            positions = self.exchange.fetch_positions([self.symbol])
+            total = 0.0
+            for p in positions:
+                side_raw = (p.get("side") or "").lower()
+                side = "buy" if side_raw in {"buy", "long"} else "sell" if side_raw in {"sell", "short"} else ""
+                qty = float(p.get("contracts", 0) or 0)
+                if qty <= 1e-6:
+                    continue
+                if (side == "buy" and self.direction == "LONG") or (side == "sell" and self.direction == "SHORT"):
+                    total += qty
+            return total
+        except Exception:
+            return 0.0
+
     @staticmethod
     def _is_order_not_found(err: Exception) -> bool:
         """Грубая эвристика: Bybit/CCXT часто возвращают 'not found' разными текстами/кодами."""
@@ -131,10 +148,17 @@ class BybitVWAPStrategy:
         updated = False
 
         for t in trades or []:
-            ts = int(t.get("timestamp") or 0)
+            info = t.get("info") or {}
+            ts = int(
+                t.get("timestamp")
+                or info.get("execTime")
+                or info.get("tradeTimeMs")
+                or info.get("ts")
+                or 0
+            )
             if ts > max_ts:
                 max_ts = ts
-            order_id = t.get("order") or (t.get("info") or {}).get("orderId")
+            order_id = t.get("order") or info.get("orderId") or info.get("orderID")
             if not order_id:
                 continue
 
@@ -146,11 +170,7 @@ class BybitVWAPStrategy:
                 if pos.get("entry_order_id") != order_id:
                     continue
 
-                pos["active"] = True
-                pos["filled"] = True
-                pos["filled_entry_order_id"] = order_id
-                pos.pop("entry_order_id", None)
-                logger.info(f"ВХОД {key} ПОДТВЕРЖДЁН ПО СДЕЛКАМ (orderId={order_id})")
+                self._mark_level_filled(key, pos, str(order_id), f"по сделкам (orderId={order_id})")
                 updated = True
                 break
 
@@ -483,14 +503,39 @@ class BybitVWAPStrategy:
                         has_position = True
 
             if has_position:
-                active_keys = [k for k, v in self.state["positions"].items() if v.get("active", False)]
-                if not active_keys:
-                    logger.info("ОБНАРУЖЕНА ОТКРЫТАЯ ПОЗИЦИЯ — ВОССТАНАВЛИВАЕМ ФЛАГ")
-                    if "level_1" in self.state["positions"]:
-                        self.state["positions"]["level_1"]["active"] = True
-                        self.state["positions"]["level_1"]["filled"] = True
-                        logger.info("Восстановлен флаг level_1")
-                        self.save_state()
+                # Если позиция есть, но флаги уровней не соответствуют размеру позиции,
+                # восстанавливаем уровни последовательно (level_1..level_n) по накопленной qty.
+                # Это делает поведение уровней 2-4 таким же надёжным, как у level_1.
+                pos_qty = float(total_qty)
+                if pos_qty > 1e-6:
+                    def lvl_num(k: str) -> int:
+                        try:
+                            return int(k.split("_", 1)[1])
+                        except Exception:
+                            return 999
+
+                    levels = [(k, v) for k, v in self.state["positions"].items() if isinstance(v, dict) and k.startswith("level_")]
+                    levels.sort(key=lambda kv: lvl_num(kv[0]))
+                    recorded = sum(float(v.get("qty", 0) or 0) for _, v in levels if v.get("filled"))
+                    # Если записано меньше, чем фактически в позиции — добираем уровни по порядку
+                    if recorded + 1e-6 < pos_qty:
+                        remaining = pos_qty - recorded
+                        restored = 0
+                        for k, v in levels:
+                            if v.get("filled") or v.get("active"):
+                                continue
+                            q = float(v.get("qty", 0) or 0)
+                            if q <= 0:
+                                continue
+                            # если позиция стала больше хотя бы на половину уровня — считаем, что этот уровень сработал
+                            if remaining >= q * 0.5:
+                                oid = v.get("entry_order_id") or v.get("filled_entry_order_id") or "unknown"
+                                self._mark_level_filled(k, v, str(oid), f"восстановление по размеру позиции ({pos_qty:.6f})")
+                                restored += 1
+                                remaining -= q
+                        if restored:
+                            self.save_state()
+                            logger.info(f"Восстановлено уровней по размеру позиции: {restored}")
 
             elif total_qty < 1e-6:
                 closed_keys = []
@@ -765,7 +810,48 @@ class BybitVWAPStrategy:
             open_orders = self.exchange.fetch_open_orders(self.symbol)
             open_by_id = {o.get("id"): o for o in open_orders if o.get("id")}
             open_ids = set(open_by_id.keys())
-            has_pos = self._has_exchange_position()
+            pos_qty = self._get_exchange_position_qty()
+            has_pos = pos_qty > 1e-6
+
+            # Фоллбек: если позиция на бирже увеличилась, но конкретный orderId не подтверждается,
+            # отмечаем уровни как сработавшие по размеру позиции (по порядку уровней).
+            if has_pos:
+                recorded_qty = 0.0
+                for k, p in self.state.get("positions", {}).items():
+                    if isinstance(p, dict) and p.get("filled"):
+                        recorded_qty += float(p.get("qty", 0) or 0)
+                if pos_qty > recorded_qty + 1e-6:
+                    remaining = pos_qty - recorded_qty
+
+                    def lvl_num(k: str) -> int:
+                        try:
+                            return int(k.split("_", 1)[1])
+                        except Exception:
+                            return 999
+
+                    candidates = []
+                    for k, p in self.state.get("positions", {}).items():
+                        if not isinstance(p, dict) or not k.startswith("level_"):
+                            continue
+                        if p.get("filled") or p.get("active"):
+                            continue
+                        oid = p.get("entry_order_id")
+                        if oid and oid not in open_ids:
+                            candidates.append((lvl_num(k), k, p, oid))
+                    candidates.sort()
+
+                    for _, k, p, oid in candidates:
+                        q = float(p.get("qty", 0) or 0)
+                        if q <= 0:
+                            continue
+                        if remaining >= q * 0.5:
+                            self._mark_level_filled(k, p, str(oid), f"по размеру позиции (delta≈{remaining:.6f})")
+                            try:
+                                self.exchange.cancel_order(str(oid), self.symbol)
+                            except Exception:
+                                pass
+                            remaining -= q
+                            executed = True
 
             for key, pos in list(self.state["positions"].items()):
                 if pos.get("active") or "entry_order_id" not in pos:
