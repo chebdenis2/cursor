@@ -305,30 +305,64 @@ class BybitVWAPStrategy:
                 if not cid or self.client_prefix not in cid or "_E" not in cid:
                     continue
 
-                found = False
+                oid = order.get("id")
+                if not oid:
+                    continue
+
+                found_key = None
+                found_pos = None
                 for key, pos in self.state["positions"].items():
-                    if pos.get("entry_order_id") == order["id"]:
-                        if pos.get("active", False):
-                            found = True
-                            break
-
-                        try:
-                            self.exchange.cancel_order(order["id"], self.symbol)
-                            cancelled += 1
-                            pos.pop("entry_order_id", None)
-                            logger.info(f"Отменена устаревшая лимитка {key}")
-                        except Exception:
-                            pass
-
-                        found = True
+                    if isinstance(pos, dict) and pos.get("entry_order_id") == oid:
+                        found_key = key
+                        found_pos = pos
                         break
 
-                if not found:
+                # Если ордер не найден в state — отменяем как мусор
+                if not found_pos:
                     try:
-                        self.exchange.cancel_order(order["id"], self.symbol)
+                        self.exchange.cancel_order(oid, self.symbol)
                         cancelled += 1
                     except Exception:
                         pass
+                    continue
+
+                # Если уровень уже сработал — не отменяем (на всякий случай)
+                if found_pos.get("active") or found_pos.get("filled"):
+                    continue
+
+                # Критично: если ордер частично/полностью исполнился, сначала фиксируем уровень,
+                # затем отменяем остаток, чтобы этот уровень больше не входил повторно.
+                try:
+                    filled = float(order.get("filled") or 0)
+                except Exception:
+                    filled = 0.0
+
+                if filled <= 0:
+                    # Иногда filled не приходит в open_orders — уточняем через fetch_order
+                    try:
+                        o = self.exchange.fetch_order(oid, self.symbol)
+                        filled = float(o.get("filled") or 0)
+                    except Exception:
+                        filled = 0.0
+
+                if filled > 0 and self._has_exchange_position():
+                    self._mark_level_filled(found_key, found_pos, oid, f"filled>0 при отмене ({filled})")
+                    try:
+                        self.exchange.cancel_order(oid, self.symbol)
+                        cancelled += 1
+                    except Exception:
+                        pass
+                    continue
+
+                # Без исполнения — можно отменять
+                try:
+                    self.exchange.cancel_order(oid, self.symbol)
+                    cancelled += 1
+                    found_pos.pop("entry_order_id", None)
+                    found_pos.pop("entry_order_ts", None)
+                    logger.info(f"Отменена устаревшая лимитка {found_key}")
+                except Exception:
+                    pass
 
             if cancelled:
                 logger.info(f"Отменено {cancelled} устаревших входных лимиток")
@@ -840,7 +874,6 @@ class BybitVWAPStrategy:
                         self.update_tp_sl_for_all(vwap)
 
                     # На каждой новой свече принудительно перевыставляем входные лимитки
-                    self.cancel_all_pending_entries()
                     self.place_all_entry_orders(levels["entry_levels"])
 
                 if last_vwap and abs(vwap - last_vwap) / vwap > 0.0005:
